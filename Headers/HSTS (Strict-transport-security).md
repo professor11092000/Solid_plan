@@ -64,3 +64,24 @@ After that, whenever the user tries to visit: http://example.com
 the browser upgrades it to: https://example.com
 before sending the request (assuming the policy is still valid).
 
+
+---
+
+## Edge Cases
+
+1) What if a subdomain doesn't support HTTPS but parent uses includeSubDomains?
+
+```
+example.com
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+```
+But:
+```
+legacy.example.com
+does not support HTTPS.
+```
+Result:
+- Browser forces HTTPS.
+- HTTPS connection fails.
+- User cannot access the site.
+This is why organizations must ensure all subdomains support HTTPS before enabling includeSubDomains.
