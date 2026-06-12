@@ -85,3 +85,11 @@ Result:
 - HTTPS connection fails.
 - User cannot access the site.
 This is why organizations must ensure all subdomains support HTTPS before enabling includeSubDomains.
+
+
+2) Can HSTS be set over HTTP?
+--> No.
+Browser only accept HSTS headers received over a valid HTTPS connection.
+An attacker could otherwise send fake HSTS headers over HTTP.
+
+3) 
