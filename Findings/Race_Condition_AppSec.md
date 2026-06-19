@@ -1,0 +1,1247 @@
+# Race Condition — Expert-Level AppSec & Penetration Testing Reference
+
+> **Audience:** Application Security Engineers, Penetration Testers, Bug Bounty Hunters  
+> **Scope:** Concepts → Discovery → Exploitation → Code Review → Remediation → Interview Prep
+
+---
+
+## Table of Contents
+
+1. [What Is a Race Condition?](#1-what-is-a-race-condition)
+2. [Why Does It Exist?](#2-why-does-it-exist)
+3. [Core Concepts You Must Know](#3-core-concepts-you-must-know)
+4. [Types of Race Conditions](#4-types-of-race-conditions)
+5. [TOCTOU — Deep Dive](#5-toctou--deep-dive)
+6. [How Race Conditions Work (Mechanics)](#6-how-race-conditions-work-mechanics)
+7. [Where to Find Race Conditions](#7-where-to-find-race-conditions)
+8. [How to Find Race Conditions (Methodology)](#8-how-to-find-race-conditions-methodology)
+9. [Tools & Extensions](#9-tools--extensions)
+10. [Vulnerable Code Samples](#10-vulnerable-code-samples)
+11. [Code Review — Identifying Race Conditions Statically](#11-code-review--identifying-race-conditions-statically)
+12. [Real-World Exploitation Scenarios](#12-real-world-exploitation-scenarios)
+13. [Impact](#13-impact)
+14. [Root Cause Analysis](#14-root-cause-analysis)
+15. [Remediation](#15-remediation)
+16. [Interview Questions & Scenario Walkthroughs](#16-interview-questions--scenario-walkthroughs)
+17. [Quick Reference Cheat Sheet](#17-quick-reference-cheat-sheet)
+
+---
+
+## 1. What Is a Race Condition?
+
+A **race condition** is a flaw that occurs when a system's behavior depends on the **sequence or timing of uncontrollable events** — and that sequence produces an unintended outcome when two or more operations run concurrently and "race" to access or modify a shared resource.
+
+In security context:
+> An attacker manipulates the **timing** of requests to exploit the window between a **check** and the **action** that follows, or to abuse a shared state that was never designed to be accessed simultaneously.
+
+**Simple analogy:**  
+Two people simultaneously check a bank account with $100. Both see $100, both withdraw $100. The account goes to -$100. The bank "lost" $100 because neither transaction knew the other was happening.
+
+---
+
+## 2. Why Does It Exist?
+
+| Root Cause | Explanation |
+|---|---|
+| **Shared mutable state** | Multiple threads/processes read and write the same data without coordination |
+| **Non-atomic operations** | A logical "single operation" (check → use → update) is actually multiple steps at the OS/DB level |
+| **Lack of synchronization** | No locks, mutexes, or transactions protect critical sections |
+| **Optimistic concurrency assumptions** | Developers assume sequential execution in inherently concurrent environments |
+| **Stateless HTTP + stateful backend** | HTTP is connectionless; backends maintain state — concurrent requests can interleave |
+| **Distributed systems** | Microservices, caches, and queues introduce propagation delays and eventual consistency windows |
+| **Language/runtime concurrency** | Multi-threaded languages (Java, C#) or async frameworks (Node.js event loop misuse) expose shared state |
+
+---
+
+## 3. Core Concepts You Must Know
+
+### 3.1 Concurrency vs Parallelism
+
+| Term | Meaning |
+|---|---|
+| **Concurrency** | Multiple tasks make progress by interleaving on one or more cores (logical simultaneity) |
+| **Parallelism** | Multiple tasks literally run at the exact same instant on multiple cores (physical simultaneity) |
+
+Race conditions can occur in both — concurrency is sufficient; full parallelism makes them more frequent.
+
+### 3.2 Critical Section
+
+The **critical section** is the piece of code that accesses shared resources and **must not be executed by more than one thread/process at a time**. If this section is unprotected, a race condition exists.
+
+```
+Thread A: [READ balance] → [CALCULATE new balance] → [WRITE new balance]
+Thread B:                      [READ balance]      → [CALCULATE new balance] → [WRITE new balance]
+                                    ↑ Thread B reads STALE value here
+```
+
+### 3.3 Mutex / Lock
+
+A **mutex** (mutual exclusion lock) ensures only one thread enters the critical section at a time. If Thread A holds the lock, Thread B must wait.
+
+### 3.4 Semaphore
+
+A **semaphore** is a signaling mechanism that controls access to a resource pool. A binary semaphore acts like a mutex. A counting semaphore allows N concurrent accesses.
+
+### 3.5 Deadlock
+
+When two or more threads wait indefinitely for each other to release locks — neither can proceed. A poorly fixed race condition can introduce deadlocks.
+
+### 3.6 Atomicity
+
+An **atomic operation** completes as a single, indivisible unit — no other thread can observe it in an intermediate state. Database transactions and CPU-level compare-and-swap (CAS) instructions provide atomicity.
+
+### 3.7 Idempotency
+
+An operation is **idempotent** if executing it multiple times produces the same result as executing it once. Idempotent endpoints are naturally more resistant to replay-style race attacks.
+
+### 3.8 Eventual Consistency
+
+In distributed systems, a write to one node may not immediately reflect on another. This consistency lag creates a window where stale data is read — a distributed race condition.
+
+---
+
+## 4. Types of Race Conditions
+
+### 4.1 Classic Data Race
+Two threads access the same memory/variable simultaneously, at least one is a write, and there is no synchronization. This is the textbook definition at the code level.
+
+### 4.2 TOCTOU (Time-of-Check to Time-of-Use)
+The most common in web security. A check is performed, then a separate use/action happens — an attacker modifies state in between. *(Full deep-dive in Section 5)*
+
+### 4.3 Order-of-Execution Race
+The program assumes operations complete in a specific order, but concurrent execution breaks that assumption.
+
+Example: A session is created in Thread A, but Thread B reads the session before Thread A finishes writing all session attributes.
+
+### 4.4 Limit/Quota Override Race
+An application enforces a limit (e.g., "you can only redeem this coupon once") using a check-then-act pattern. Concurrent requests all pass the check before any write completes.
+
+### 4.5 Database Race Condition
+Two transactions read the same row, both compute an update based on the read value, and both write back — the second write overwrites the first (lost update problem).
+
+### 4.6 File System Race Condition
+A process checks a file's permissions or existence (e.g., `access()`) then opens it (`open()`). An attacker replaces the file with a symlink between those two calls.
+
+### 4.7 Signal Race Condition
+In Unix systems, a signal handler interrupts normal execution. If the handler and main program access shared state, a race exists. Relevant in binary exploitation.
+
+### 4.8 Initialization Race
+A shared object is checked for initialization (`if (!initialized)`) by multiple threads simultaneously — all see it as uninitialized and all attempt to initialize it (classic double-checked locking bug).
+
+### 4.9 Cache Race Condition
+Application reads from cache → cache miss → multiple threads all query the DB and populate the cache simultaneously (cache stampede). In security, stale cache entries can hold old permission states.
+
+---
+
+## 5. TOCTOU — Deep Dive
+
+**Time-of-Check to Time-of-Use** is the dominant race condition pattern in web application security.
+
+### The Pattern
+
+```
+1. CHECK  → "Is this coupon valid and unused?"   → Answer: YES
+2. [WINDOW] → Attacker sends 20 parallel requests through this window
+3. USE    → "Mark coupon as used, apply discount" → Runs 20 times
+```
+
+### Why the Window Exists
+
+HTTP applications typically:
+1. Read state from DB
+2. Make a business logic decision
+3. Write updated state to DB
+
+Steps 1–3 are **not atomic by default**. Between steps 1 and 3, the state in the DB still reflects the "old" value. Concurrent requests all read this old value and all pass the check.
+
+### TOCTOU in File Operations (OS Level)
+
+```c
+// Vulnerable C code
+if (access("/tmp/userfile", R_OK) == 0) {   // CHECK: Can I read this?
+    // WINDOW: attacker replaces /tmp/userfile with symlink to /etc/shadow
+    fd = open("/tmp/userfile", O_RDONLY);    // USE: Opens /etc/shadow instead
+}
+```
+
+The `access()` call checks as the **real user**, `open()` runs as the **effective user** (potentially root). This is a classic privilege escalation vector in SUID binaries.
+
+### TOCTOU in Web Applications
+
+```
+GET /api/redeem?coupon=SAVE50   → Check: coupon unused → proceed
+GET /api/redeem?coupon=SAVE50   → Check: coupon unused → proceed (race!)
+GET /api/redeem?coupon=SAVE50   → Check: coupon unused → proceed (race!)
+         ↓ all arrive before any UPDATE is committed ↓
+POST updates coupon to "used" × 3 → Discount applied 3 times
+```
+
+---
+
+## 6. How Race Conditions Work (Mechanics)
+
+### The Network-Level Race Window
+
+In web pentesting, the race window is the time between the server reading state and writing updated state. The attacker's goal is to **land multiple requests inside this window**.
+
+```
+Timeline:
+T=0ms  → Request 1 arrives, reads balance ($100)
+T=1ms  → Request 2 arrives, reads balance ($100)  ← RACE WINDOW
+T=2ms  → Request 1 writes new balance ($0)
+T=3ms  → Request 2 writes new balance ($0)  ← Should have been -$100 or rejected
+```
+
+### Last-Write-Wins Problem
+
+Without locking, the last write to complete wins and silently discards the other's update. Neither request errors out — the system appears to work correctly, masking the corruption.
+
+### Connection Warming (HTTP/2 Single-Packet Attack)
+
+Modern race condition exploitation leverages **HTTP/2 multiplexing**. Multiple requests are bundled into a **single TCP packet** and sent simultaneously — they arrive at the server within microseconds of each other, dramatically narrowing the race window needed.
+
+```
+HTTP/1.1: Request1 → wait → Request2 → (network jitter separates them)
+HTTP/2:   [Request1 + Request2 in ONE packet] → both parsed simultaneously
+```
+
+This technique, popularized by James Kettle (PortSwigger), makes previously "theoretical" race conditions practically exploitable.
+
+---
+
+## 7. Where to Find Race Conditions
+
+### High-Value Target Endpoints
+
+| Feature | Race Attack Goal |
+|---|---|
+| **Coupon / promo code redemption** | Use once → exploit many times |
+| **Gift card balance** | Drain balance via concurrent withdrawals |
+| **Account credit / wallet** | Double-spend or overdraft |
+| **File upload + processing** | Upload malicious file, trigger processing before sanitization |
+| **Password reset tokens** | Consume token while it's still valid (token reuse) |
+| **Email verification / OTP** | Reuse single-use codes |
+| **Rate limiting / attempt counters** | Bypass lockout by racing before counter increments |
+| **Inventory / stock checks** | Order more than available stock |
+| **Permission checks** | Perform action between privilege downgrade and enforcement |
+| **Account deletion + action** | Perform privileged action after deletion request but before cleanup |
+| **Payment processing** | Double-charge or bypass payment |
+| **Session creation** | Hijack partially initialized session |
+| **Cache invalidation** | Read stale permissions from cache |
+
+### Application Architecture Indicators
+
+These patterns in an app's architecture signal race condition risk:
+
+- **Microservices** — distributed state, eventual consistency gaps
+- **Message queues** (RabbitMQ, Kafka) — async processing creates windows
+- **Redis/Memcache** caching of auth/permission data
+- **Background jobs** (Celery, Sidekiq) — state checked before job runs, changed after
+- **Optimistic locking in ORMs** — if not properly implemented, creates windows
+- **Stateful multi-step workflows** — wizard-style flows with intermediate states
+
+---
+
+## 8. How to Find Race Conditions (Methodology)
+
+### Step 1 — Reconnaissance & Mapping
+
+- Map all endpoints that involve **state changes** (POST, PUT, PATCH, DELETE)
+- Identify **single-use** operations (coupons, OTPs, tokens, limits)
+- Look for **balance/count/quota** endpoints
+- Check for **multi-step workflows** where state is carried between requests
+
+### Step 2 — Manual Analysis
+
+Ask for each endpoint:
+1. Does this read state, make a decision, then write state?
+2. Is this operation database-atomic (single statement) or multi-step?
+3. Is there a unique constraint, row-level lock, or transaction at the DB?
+4. Does the response time suggest async processing?
+
+### Step 3 — Timing Fingerprinting
+
+Send a legitimate request and observe:
+- Response time variance (suggests DB writes, queues, or locks)
+- Different responses on retry (suggests state change happened)
+- Error messages mentioning "conflict," "duplicate," "already processed"
+
+### Step 4 — Exploitation Attempt
+
+**Single-packet attack (HTTP/2) — recommended:**
+
+1. Identify target endpoint
+2. Use Burp Suite Repeater → Group → Send group in parallel
+3. Or use Turbo Intruder with single-packet HTTP/2 template
+4. Send 20–50 concurrent requests
+5. Analyze responses for anomalies (multiple 200s where only 1 expected, unexpected state changes)
+
+**Timing attack for hidden states:**
+
+Send concurrent requests to different endpoints that share state — e.g., simultaneously triggering password reset AND changing the email address.
+
+### Step 5 — Confirmation
+
+A race condition is confirmed when:
+- Multiple requests return "success" where only one should
+- Shared resource is in an inconsistent state after concurrent requests
+- A limit/quota is exceeded
+- A single-use item is consumed more than once
+
+---
+
+## 9. Tools & Extensions
+
+### Burp Suite (Primary Tool)
+
+| Feature | How to Use |
+|---|---|
+| **Repeater → Send group in parallel** | Add requests to a tab group, use "Send group in parallel" for basic races |
+| **Turbo Intruder** | Extension for high-speed, precise concurrent request sending |
+| **HTTP/2 support** | Enable in Project Options → HTTP/2; required for single-packet attack |
+| **Logger++** | Capture and analyze all concurrent response timings |
+
+### Turbo Intruder — Race Condition Script
+
+```python
+# Single-packet attack template for Turbo Intruder
+def queueRequests(target, wordlists):
+    engine = RequestEngine(endpoint=target.endpoint,
+                           concurrentConnections=1,
+                           engine=Engine.BURP2)  # HTTP/2
+    for i in range(20):
+        engine.queue(target.req, gate='race1')
+    engine.openGate('race1')  # Release all at once
+
+def handleResponse(req, interesting):
+    table.add(req)
+```
+
+### Other Tools
+
+| Tool | Purpose |
+|---|---|
+| **FFUF** | Concurrent fuzzing; `-rate` and `-t` flags for timing control |
+| **Intruder (Burp)** | Pitchfork mode for synchronized multi-param attacks |
+| **Python + asyncio / aiohttp** | Custom concurrent request scripts |
+| **Go scripts** | goroutines for precise concurrent HTTP requests |
+| **racepwn** | Dedicated race condition testing framework |
+| **Race The Web** | Go-based tool specifically for web race conditions |
+
+### Python Race Condition PoC Template
+
+```python
+import asyncio
+import aiohttp
+
+TARGET = "https://target.com/api/redeem"
+COUPON = "SAVE50"
+CONCURRENT = 20
+
+async def redeem(session, i):
+    data = {"coupon": COUPON}
+    async with session.post(TARGET, json=data) as resp:
+        body = await resp.text()
+        print(f"[{i}] Status: {resp.status} | Response: {body[:100]}")
+
+async def main():
+    async with aiohttp.ClientSession() as session:
+        tasks = [redeem(session, i) for i in range(CONCURRENT)]
+        await asyncio.gather(*tasks)
+
+asyncio.run(main())
+```
+
+### Go Race Condition PoC Template
+
+```go
+package main
+
+import (
+    "fmt"
+    "net/http"
+    "strings"
+    "sync"
+)
+
+func main() {
+    var wg sync.WaitGroup
+    target := "https://target.com/api/redeem"
+    
+    for i := 0; i < 20; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            body := strings.NewReader(`{"coupon":"SAVE50"}`)
+            resp, err := http.Post(target, "application/json", body)
+            if err != nil {
+                fmt.Printf("[%d] Error: %v\n", id, err)
+                return
+            }
+            fmt.Printf("[%d] Status: %d\n", id, resp.StatusCode)
+        }(i)
+    }
+    wg.Wait()
+}
+```
+
+---
+
+## 10. Vulnerable Code Samples
+
+### 10.1 PHP — Coupon Redemption (Vulnerable)
+
+```php
+<?php
+// VULNERABLE: Classic TOCTOU race condition
+function redeemCoupon($userId, $couponCode) {
+    $db = getDB();
+    
+    // CHECK
+    $coupon = $db->query(
+        "SELECT * FROM coupons WHERE code = ? AND used = 0", 
+        [$couponCode]
+    )->fetch();
+    
+    if (!$coupon) {
+        return ["error" => "Coupon invalid or already used"];
+    }
+    
+    // WINDOW — concurrent requests all pass the check above
+    // before any of them execute the UPDATE below
+    
+    // USE
+    $db->query(
+        "UPDATE coupons SET used = 1, used_by = ? WHERE code = ?",
+        [$userId, $couponCode]
+    );
+    
+    applyDiscount($userId, $coupon['discount']);
+    return ["success" => "Discount applied: " . $coupon['discount'] . "%"];
+}
+```
+
+**Fixed Version:**
+
+```php
+<?php
+// FIXED: Atomic update-then-check pattern
+function redeemCoupon($userId, $couponCode) {
+    $db = getDB();
+    
+    // Atomic: UPDATE only if currently unused
+    $affected = $db->query(
+        "UPDATE coupons SET used = 1, used_by = ?, used_at = NOW() 
+         WHERE code = ? AND used = 0",
+        [$userId, $couponCode]
+    )->rowCount();
+    
+    if ($affected === 0) {
+        return ["error" => "Coupon invalid or already used"];
+    }
+    
+    $coupon = $db->query(
+        "SELECT discount FROM coupons WHERE code = ?", 
+        [$couponCode]
+    )->fetch();
+    
+    applyDiscount($userId, $coupon['discount']);
+    return ["success" => "Discount applied"];
+}
+```
+
+---
+
+### 10.2 Python/Flask — Wallet Balance (Vulnerable)
+
+```python
+# VULNERABLE: Non-atomic balance check and deduction
+@app.route('/transfer', methods=['POST'])
+def transfer():
+    user_id = session['user_id']
+    amount = request.json['amount']
+    
+    user = db.session.query(User).filter_by(id=user_id).first()
+    
+    # CHECK
+    if user.balance < amount:
+        return jsonify({"error": "Insufficient funds"}), 400
+    
+    # WINDOW — all concurrent requests pass the check above
+    
+    # USE
+    user.balance -= amount          # Read-modify-write (NOT atomic)
+    db.session.commit()
+    
+    return jsonify({"new_balance": user.balance})
+```
+
+**Fixed Version:**
+
+```python
+# FIXED: Atomic DB-level update with constraint
+@app.route('/transfer', methods=['POST'])
+def transfer():
+    user_id = session['user_id']
+    amount = request.json['amount']
+    
+    # Single atomic SQL statement — DB enforces constraint
+    result = db.session.execute(
+        text("""
+            UPDATE users 
+            SET balance = balance - :amount 
+            WHERE id = :user_id AND balance >= :amount
+        """),
+        {"amount": amount, "user_id": user_id}
+    )
+    db.session.commit()
+    
+    if result.rowcount == 0:
+        return jsonify({"error": "Insufficient funds"}), 400
+    
+    new_balance = db.session.query(User.balance).filter_by(id=user_id).scalar()
+    return jsonify({"new_balance": new_balance})
+```
+
+---
+
+### 10.3 Node.js — OTP Verification (Vulnerable)
+
+```javascript
+// VULNERABLE: OTP consumed after check, not atomically
+app.post('/verify-otp', async (req, res) => {
+    const { userId, otp } = req.body;
+    
+    // CHECK
+    const record = await db.query(
+        'SELECT * FROM otp_tokens WHERE user_id = ? AND token = ? AND expires_at > NOW()',
+        [userId, otp]
+    );
+    
+    if (record.length === 0) {
+        return res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+    
+    // WINDOW — concurrent requests with same OTP all pass
+    
+    // USE — delete token
+    await db.query('DELETE FROM otp_tokens WHERE user_id = ? AND token = ?', [userId, otp]);
+    
+    // Grant access
+    req.session.authenticated = true;
+    return res.json({ success: true });
+});
+```
+
+**Fixed Version:**
+
+```javascript
+// FIXED: Atomic delete-then-check
+app.post('/verify-otp', async (req, res) => {
+    const { userId, otp } = req.body;
+    
+    // Atomically delete the token — only one concurrent request can succeed
+    const result = await db.query(
+        'DELETE FROM otp_tokens WHERE user_id = ? AND token = ? AND expires_at > NOW()',
+        [userId, otp]
+    );
+    
+    if (result.affectedRows === 0) {
+        return res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+    
+    req.session.authenticated = true;
+    return res.json({ success: true });
+});
+```
+
+---
+
+### 10.4 Java — Inventory Check (Vulnerable)
+
+```java
+// VULNERABLE: Check-then-act without transaction isolation
+public boolean purchaseItem(int userId, int itemId, int quantity) {
+    Item item = itemRepository.findById(itemId);
+    
+    // CHECK
+    if (item.getStock() < quantity) {
+        throw new InsufficientStockException("Not enough stock");
+    }
+    
+    // WINDOW — multiple threads see same stock level
+    
+    // USE
+    item.setStock(item.getStock() - quantity);  // Lost update problem
+    itemRepository.save(item);
+    orderService.createOrder(userId, itemId, quantity);
+    return true;
+}
+```
+
+**Fixed Version:**
+
+```java
+// FIXED: Pessimistic locking with @Transactional
+@Transactional(isolation = Isolation.SERIALIZABLE)
+public boolean purchaseItem(int userId, int itemId, int quantity) {
+    // Acquire row-level lock — SELECT ... FOR UPDATE
+    Item item = itemRepository.findByIdWithLock(itemId);  
+    
+    if (item.getStock() < quantity) {
+        throw new InsufficientStockException("Not enough stock");
+    }
+    
+    item.setStock(item.getStock() - quantity);
+    itemRepository.save(item);
+    orderService.createOrder(userId, itemId, quantity);
+    return true;
+}
+
+// Repository method
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("SELECT i FROM Item i WHERE i.id = :id")
+Item findByIdWithLock(@Param("id") int id);
+```
+
+---
+
+### 10.5 C — File TOCTOU (Vulnerable)
+
+```c
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdio.h>
+
+// VULNERABLE: Classic TOCTOU in file operation (SUID binary)
+void readUserFile(const char *path) {
+    // CHECK: access() uses real UID
+    if (access(path, R_OK) != 0) {
+        printf("Access denied\n");
+        return;
+    }
+    
+    // WINDOW: attacker replaces path with symlink to /etc/shadow
+    
+    // USE: open() uses effective UID (root if SUID)
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("Cannot open file\n");
+        return;
+    }
+    // Reads attacker-chosen file as root
+    char buf[4096];
+    read(fd, buf, sizeof(buf));
+    printf("%s", buf);
+    close(fd);
+}
+```
+
+**Fixed Version:**
+
+```c
+// FIXED: Drop privileges before opening, or use O_NOFOLLOW
+void readUserFile(const char *path) {
+    // Drop to real UID before opening — eliminates the privilege gap
+    seteuid(getuid());
+    
+    // O_NOFOLLOW prevents symlink following
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        printf("Cannot open file\n");
+        return;
+    }
+    // Now verify the open file is what we expected using fstat()
+    struct stat st;
+    fstat(fd, &st);
+    // ... validate ownership, permissions on fd not path
+    char buf[4096];
+    read(fd, buf, sizeof(buf));
+    printf("%s", buf);
+    close(fd);
+}
+```
+
+---
+
+### 10.6 Ruby on Rails — Limit Bypass (Vulnerable)
+
+```ruby
+# VULNERABLE: Rate limit check outside transaction
+class Api::RedemptionsController < ApplicationController
+  def create
+    user = current_user
+    
+    # CHECK
+    if user.redemptions.today.count >= 3
+      render json: { error: "Daily limit reached" }, status: :too_many_requests
+      return
+    end
+    
+    # WINDOW — all concurrent requests see count < 3
+    
+    # USE
+    Redemption.create!(user: user, item_id: params[:item_id])
+    render json: { success: true }
+  end
+end
+```
+
+**Fixed Version:**
+
+```ruby
+# FIXED: Database-level unique constraint + advisory lock
+class Api::RedemptionsController < ApplicationController
+  def create
+    user = current_user
+    
+    ActiveRecord::Base.transaction do
+      # Advisory lock prevents concurrent execution for same user
+      ActiveRecord::Base.connection.execute(
+        "SELECT pg_advisory_xact_lock(#{user.id})"
+      )
+      
+      if user.redemptions.today.count >= 3
+        render json: { error: "Daily limit reached" }, status: :too_many_requests
+        return
+      end
+      
+      Redemption.create!(user: user, item_id: params[:item_id])
+    end
+    
+    render json: { success: true }
+  end
+end
+```
+
+---
+
+## 11. Code Review — Identifying Race Conditions Statically
+
+### Patterns to Hunt For
+
+#### Pattern 1: Read → Decide → Write (without transaction)
+
+```
+# Red flag pattern
+value = read_from_db(key)       # READ
+if value meets condition:        # DECIDE
+    write_to_db(key, new_value) # WRITE  ← No atomic guarantee
+```
+
+Look for: `SELECT` followed by business logic followed by `UPDATE/INSERT` outside a transaction.
+
+#### Pattern 2: ORM `.save()` After In-Memory Modification
+
+```python
+# Red flag
+obj = Model.objects.get(id=pk)
+obj.count += 1          # In-memory modification of read value
+obj.save()              # Lost update if concurrent
+```
+
+Safe alternative: `Model.objects.filter(id=pk).update(count=F('count') + 1)`
+
+#### Pattern 3: Existence Check Before Insert
+
+```sql
+-- Red flag
+SELECT COUNT(*) FROM table WHERE condition  -- Check
+INSERT INTO table (...)                     -- Insert (duplicate possible)
+```
+
+Safe alternative: `INSERT ... ON CONFLICT DO NOTHING` (PostgreSQL) or `INSERT IGNORE` (MySQL), or a UNIQUE constraint.
+
+#### Pattern 4: Flag Set After Action
+
+```python
+# Red flag
+perform_action()      # Action done
+record.used = True    # Flag set separately — window between these
+record.save()
+```
+
+Safe alternative: Atomic update-first, then perform action only if update succeeded.
+
+#### Pattern 5: Cache Read Before DB Write
+
+```python
+# Red flag
+perms = cache.get(f"user:{user_id}:perms")  # May be stale
+if "admin" in perms:
+    perform_admin_action()
+```
+
+#### Static Analysis Grep Patterns
+
+```bash
+# Hunt for non-atomic patterns in Python/Django
+grep -rn "\.save()" app/ | grep -v "atomic"
+grep -rn "objects\.get" app/ --include="*.py"
+
+# Hunt for TOCTOU in PHP
+grep -rn "SELECT.*WHERE.*used.*=.*0" . --include="*.php"
+
+# Hunt for file TOCTOU in C
+grep -rn "access(" . --include="*.c"
+
+# Hunt for missing transactions in Java
+grep -rn "repository\.save" src/ | grep -v "@Transactional"
+
+# Hunt for missing FOR UPDATE in SQL
+grep -rn "SELECT" . --include="*.sql" | grep -v "FOR UPDATE"
+```
+
+### SAST Tools for Race Conditions
+
+| Tool | Language | Notes |
+|---|---|---|
+| **Semgrep** | Multi-language | Custom rules for TOCTOU patterns |
+| **CodeQL** | Multi-language | GitHub's static analysis; race condition queries available |
+| **SpotBugs + FindSecBugs** | Java | Detects threading issues |
+| **ThreadSanitizer (TSan)** | C/C++/Go | Runtime race detector |
+| **Coverity** | Multi-language | Enterprise SAST with concurrency analysis |
+| **Pylint** | Python | Limited threading checks |
+| **go race detector** | Go | `go test -race ./...` built into toolchain |
+
+---
+
+## 12. Real-World Exploitation Scenarios
+
+### Scenario 1: E-Commerce Coupon Abuse
+
+**Target:** `POST /checkout/apply-coupon`  
+**Goal:** Apply a single-use 50% coupon multiple times
+
+**Steps:**
+1. Add items to cart (total: $200)
+2. Capture `POST /checkout/apply-coupon` with `coupon=HALF50` in Burp
+3. Open Turbo Intruder, load the single-packet race template
+4. Send 25 concurrent requests
+5. Observe: 15-20 return `{"success": true, "discount": "$100"}`
+6. Final order shows cumulative discount applied
+
+**Impact:** 50–100% discount obtained, revenue loss for merchant.
+
+---
+
+### Scenario 2: Gift Card Balance Drain
+
+**Target:** `POST /api/giftcard/redeem`  
+**Setup:** Gift card with $50 balance
+
+**Steps:**
+1. Capture redemption request
+2. Send 10 parallel requests for $50 each via HTTP/2 single-packet
+3. Multiple requests complete before balance is decremented
+4. Attacker receives $50 × N credits
+
+**Impact:** Financial loss. Seen in real bug bounty reports on major retail platforms.
+
+---
+
+### Scenario 3: Password Reset Token Reuse
+
+**Target:** `POST /auth/reset-password`  
+**Goal:** Use the same reset token twice to understand token lifecycle or chain to account takeover
+
+**Steps:**
+1. Initiate password reset → receive token via email
+2. Craft two concurrent requests: one to reset password, one to check token validity
+3. Race both requests
+4. If the token is deleted after use in a non-atomic way, a concurrent request may succeed before deletion
+
+**Impact:** Chain with email interception for account takeover; token lifetime extension.
+
+---
+
+### Scenario 4: Rate Limit / Login Brute Force Bypass
+
+**Target:** `POST /auth/login` with lockout after 5 failed attempts
+
+**Steps:**
+1. Prepare 20 requests with different password guesses but same username
+2. Send all as single-packet HTTP/2 burst
+3. All requests are checked against attempt counter before it increments
+4. Counter may only register 1-2 increments instead of 20
+5. Effective brute-force bypass
+
+**Impact:** Authentication bypass, brute force amplification.
+
+---
+
+### Scenario 5: Concurrent Account Deletion + Privileged Action
+
+**Target:** User account with admin privileges
+
+**Steps:**
+1. Send `DELETE /api/account` and `POST /api/admin/action` simultaneously
+2. Race the deletion cleanup against the action authorization check
+3. If auth check passes before deletion invalidates the session, privileged action executes on a "deleted" account
+
+**Impact:** Post-deletion privilege execution; potential data exfiltration window.
+
+---
+
+### Scenario 6: File Upload Race (Web Shell Upload)
+
+**Target:** Application that scans uploaded files for malware before serving them
+
+**Steps:**
+1. Upload a web shell (e.g., `shell.php`)
+2. Immediately (in parallel) send GET requests to the upload path
+3. Race the GET request against the scan-and-delete process
+4. If the file is accessible before the scan completes, execute the web shell
+
+**Impact:** Remote code execution via uploaded web shell.
+
+---
+
+## 13. Impact
+
+| Impact Category | Example |
+|---|---|
+| **Financial fraud** | Double-spend, coupon abuse, gift card drain, fee bypass |
+| **Authentication bypass** | OTP reuse, token reuse, brute force via limit bypass |
+| **Privilege escalation** | Exploit window between role check and downgrade |
+| **Data integrity corruption** | Partial writes, lost updates, inconsistent DB state |
+| **Denial of Service** | Race to exhaust resources, deadlocks |
+| **Inventory manipulation** | Order more than available stock |
+| **Information disclosure** | Read files via TOCTOU symlink (SUID binary) |
+| **Remote code execution** | File upload race to execute before scan |
+| **Regulatory/compliance** | GDPR, PCI-DSS violations from inconsistent state |
+
+### CVSS Considerations for Race Conditions
+
+- Attack Complexity: usually **High** (AC:H) due to timing requirements
+- With HTTP/2 single-packet: may be reduced to **Low** (AC:L) on vulnerable endpoints
+- Privileges Required: often **Low** or **None** (authenticated user exploiting business logic)
+- Impact: can reach **Critical** (financial fraud, RCE, auth bypass)
+
+---
+
+## 14. Root Cause Analysis
+
+### Architectural Root Causes
+
+```
+1. Non-Atomic Operations
+   └── Check and act are separate DB queries
+   └── No database transaction wraps the operation
+   └── ORM in-memory read-modify-write pattern
+
+2. Missing Synchronization Primitives
+   └── No mutex/lock on critical section
+   └── No DB row-level locking (SELECT FOR UPDATE)
+   └── No Redis SETNX / distributed lock
+
+3. Optimistic Concurrency Without Conflict Detection
+   └── Version field not checked on write
+   └── ETag not validated
+   └── No retry on conflict detection
+
+4. Improper State Machine Design
+   └── Intermediate states exposed and exploitable
+   └── No idempotency keys on state-changing endpoints
+   └── Flags set post-action rather than atomically
+
+5. Infrastructure Assumptions
+   └── Single-server assumption broken by horizontal scaling
+   └── Session state not synchronized across nodes
+   └── Cache invalidation not atomic with DB write
+```
+
+---
+
+## 15. Remediation
+
+### Strategy 1: Atomic Database Operations
+
+Make the check and the state change a **single database statement**.
+
+```sql
+-- Instead of SELECT then UPDATE:
+UPDATE coupons 
+SET used = 1, used_by = 123 
+WHERE code = 'SAVE50' AND used = 0;
+-- Check affected rows: 0 = already used, 1 = success
+```
+
+### Strategy 2: Database Transactions with Proper Isolation
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+    SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;  -- Row lock
+    UPDATE accounts SET balance = balance - 100 WHERE id = 1 AND balance >= 100;
+COMMIT;
+```
+
+**Isolation Levels (ascending protection):**
+
+| Level | Prevents |
+|---|---|
+| READ UNCOMMITTED | Nothing (dirty reads possible) |
+| READ COMMITTED | Dirty reads |
+| REPEATABLE READ | Dirty reads, non-repeatable reads |
+| SERIALIZABLE | All anomalies including phantom reads (use for financial operations) |
+
+### Strategy 3: Optimistic Locking
+
+```sql
+-- Add version column
+UPDATE items 
+SET stock = stock - 1, version = version + 1 
+WHERE id = 42 AND version = 7;  -- Fails if another transaction updated first
+-- If 0 rows affected → conflict → retry
+```
+
+### Strategy 4: Unique Database Constraints
+
+```sql
+-- Prevents duplicate redemptions at DB level regardless of app logic
+ALTER TABLE redemptions ADD UNIQUE (user_id, coupon_code);
+-- Concurrent inserts will fail with constraint violation for duplicates
+```
+
+### Strategy 5: Idempotency Keys
+
+```
+POST /api/transfer
+Idempotency-Key: uuid-v4-unique-per-request
+
+Server stores: key → result
+If key already exists: return stored result, don't re-execute
+```
+
+### Strategy 6: Distributed Locking (Redis)
+
+```python
+import redis
+import uuid
+
+r = redis.Redis()
+
+def acquire_lock(resource, ttl=5000):
+    token = str(uuid.uuid4())
+    acquired = r.set(f"lock:{resource}", token, px=ttl, nx=True)
+    return token if acquired else None
+
+def release_lock(resource, token):
+    script = """
+    if redis.call('get', KEYS[1]) == ARGV[1] then
+        return redis.call('del', KEYS[1])
+    else
+        return 0
+    end
+    """
+    r.eval(script, 1, f"lock:{resource}", token)
+
+# Usage
+def redeem_coupon(user_id, coupon_code):
+    token = acquire_lock(f"coupon:{coupon_code}")
+    if not token:
+        return {"error": "Please try again"}
+    try:
+        # Critical section — only one execution at a time
+        coupon = db.get_unused_coupon(coupon_code)
+        if not coupon:
+            return {"error": "Invalid coupon"}
+        db.mark_coupon_used(coupon_code, user_id)
+        apply_discount(user_id, coupon.discount)
+        return {"success": True}
+    finally:
+        release_lock(f"coupon:{coupon_code}", token)
+```
+
+### Strategy 7: Queue-Based Serialization
+
+Route state-changing operations through a queue (Celery, SQS, BullMQ) to serialize execution per resource:
+
+```
+Concurrent requests → Queue (partitioned by resource key) → Single worker processes one at a time
+```
+
+### Strategy 8: Secure File Operations (OS Level)
+
+```c
+// Use open() directly with O_CREAT|O_EXCL for atomic create
+// Use fstat() on the fd (not stat() on the path) after opening
+// Use O_NOFOLLOW to prevent symlink attacks
+// Drop to real UID before file operations in SUID binaries
+```
+
+### Remediation Priority Matrix
+
+| Fix | Complexity | Effectiveness | Use When |
+|---|---|---|---|
+| Atomic SQL (update-check) | Low | High | Simple check-then-act |
+| DB UNIQUE constraint | Low | High | Duplicate prevention |
+| SELECT FOR UPDATE | Low | High | Row-level contention |
+| SERIALIZABLE isolation | Low | Very High | Financial transactions |
+| Optimistic locking | Medium | High | High-read, low-write |
+| Idempotency keys | Medium | High | API endpoints |
+| Redis distributed lock | Medium | High | Cross-service state |
+| Queue serialization | High | Very High | Complex workflows |
+
+---
+
+## 16. Interview Questions & Scenario Walkthroughs
+
+### Conceptual Questions
+
+**Q1: What is a race condition in the context of web security?**
+
+> A race condition occurs when an application's security decision depends on shared state that can be modified concurrently. The attacker sends multiple simultaneous requests to exploit the window between when the state is checked and when it is updated, causing the application to make incorrect security decisions based on stale data.
+
+---
+
+**Q2: What is TOCTOU and how does it differ from a generic race condition?**
+
+> TOCTOU (Time-of-Check to Time-of-Use) is a specific subtype of race condition where a security check (e.g., "is this coupon valid?") is separated in time from the use of the checked resource (e.g., "apply the coupon"). A generic race condition is any vulnerability arising from concurrent access to shared state. TOCTOU specifically describes the attack window between the check and use phases. All TOCTOU vulnerabilities are race conditions, but not all race conditions are TOCTOU.
+
+---
+
+**Q3: How does HTTP/2 make race condition exploitation more reliable?**
+
+> HTTP/2 supports multiplexing — multiple requests can be sent over a single TCP connection simultaneously. By bundling 20-50 requests into a single TCP packet (the "single-packet attack"), all requests arrive at the server within microseconds of each other, eliminating the network jitter that would normally separate them. This dramatically narrows the window required for exploitation and makes previously timing-sensitive attacks consistently reproducible.
+
+---
+
+**Q4: A web application limits coupon redemption to once per user. How would you test for a race condition?**
+
+> First, I'd capture the coupon redemption request in Burp Suite. Then I'd add it to a request group and use "Send group in parallel" or Turbo Intruder with the single-packet HTTP/2 template. I'd send 20-50 concurrent requests simultaneously. If the application is vulnerable, multiple requests will return success responses where only one should. I'd then verify by checking the account state — if the discount was applied multiple times or the coupon counter was only decremented once despite multiple successes, the race condition is confirmed.
+
+---
+
+**Q5: What database-level fix prevents the lost update problem in financial applications?**
+
+> The most reliable fix is to use an atomic SQL UPDATE statement that combines the check and the update in a single statement: `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND balance >= :amount`. Checking the affected rows count tells you if the operation succeeded. Alternatively, `SELECT ... FOR UPDATE` within a serializable transaction acquires a row-level lock that prevents other transactions from reading or writing the row until the lock is released.
+
+---
+
+**Q6: What is the difference between a mutex and a semaphore?**
+
+> A mutex is a mutual exclusion lock — only the thread that acquired it can release it, and it allows only one thread at a time. It's binary (locked/unlocked) and used for protecting a critical section. A semaphore is a signaling mechanism that can allow N concurrent accesses (counting semaphore) or just 1 (binary semaphore). Semaphores can be released by a different thread than the one that acquired them, making them suitable for producer-consumer signaling patterns.
+
+---
+
+**Q7: Can race conditions exist in single-threaded environments like Node.js?**
+
+> Yes. Node.js is single-threaded but uses an event loop with async I/O. When an async operation (like a DB query) is awaited, control returns to the event loop, which can process another incoming request. If two requests both `await db.findCoupon()`, both callbacks resume before either calls `db.markUsed()` — a race condition despite single-threaded execution. This is sometimes called a "logical race condition" or "async race condition."
+
+---
+
+**Q8: How would you find race conditions in a code review?**
+
+> I look for the read-decide-write pattern outside of transactions: any code that reads a value, makes a business decision based on it, then writes an update in separate operations. Red flags include: ORM `.save()` after in-memory modification, `SELECT COUNT(*)` followed by `INSERT`, checking a flag (`WHERE used = 0`) then separately setting it (`UPDATE SET used = 1`), and any state-changing logic that isn't wrapped in a database transaction or protected by a lock.
+
+---
+
+### Scenario Questions
+
+**Scenario A: You're pentesting an e-commerce site. The checkout flow allows applying one promo code per order. How do you approach testing this for race conditions?**
+
+> 1. Complete a test order up to checkout, apply a promo code, and capture the `POST /apply-promo` request in Burp.
+> 2. Check if the application uses HTTP/2 (Project Options → check HTTP/2 support).
+> 3. Load the request into Turbo Intruder with the single-packet race template, configure 20-30 concurrent requests.
+> 4. Send the group and observe responses — looking for multiple `200 OK` responses where only one should succeed.
+> 5. If the application uses HTTP/1.1 and doesn't support HTTP/2, try "last-byte sync" technique in Turbo Intruder — send all request headers, hold the last byte, then release all simultaneously.
+> 6. Check order totals and promo usage counters in the UI to confirm exploitation.
+> 7. Document the affected rows in the responses and the final order state as proof.
+
+---
+
+**Scenario B: A developer tells you they fixed a race condition by wrapping the logic in a try-catch for duplicate key errors. Is this a valid fix?**
+
+> Partially. Relying on a UNIQUE database constraint and catching the resulting duplicate key exception IS a valid defense — it prevents data corruption because the DB itself enforces uniqueness atomically. However, it's not complete on its own if the error handling doesn't properly roll back side effects. For example, if an email was sent or an external payment was charged before the DB write failed, catching the exception afterward doesn't undo those actions. The constraint catch should be the safety net, not the primary defense. The primary fix should be atomic SQL (`INSERT ... ON CONFLICT DO NOTHING` or update-then-check).
+
+---
+
+**Scenario C: You find that an API marks a one-time download token as "used" AFTER serving the file. Is this exploitable?**
+
+> Yes, this is a clear TOCTOU vulnerability. The window between serving the file and marking the token used means concurrent requests can all pass the "is token valid?" check before any of them trigger the "mark as used" update. An attacker can download the file multiple times with a single token. The fix is to mark the token used FIRST (atomically, using a DELETE-then-check or UPDATE-then-check pattern), and only serve the file if the atomic update succeeds. "Use-then-invalidate" is always wrong for single-use resources.
+
+---
+
+**Scenario D: You discover that a banking app uses Redis to cache user balances for performance. When is this dangerous and how would you exploit it?**
+
+> This is dangerous when the Redis cache isn't invalidated atomically with the DB write. Attack vector: (1) Trigger a large withdrawal that depletes the DB balance. (2) Immediately send concurrent requests that read from cache (stale, pre-withdrawal balance) before cache invalidation propagates. (3) Those requests make decisions (e.g., approving transfers) based on the stale cached balance. The cache is a distributed TOCTOU — the "check" reads from Redis, the "use" operates against DB, and the window is the cache TTL or invalidation propagation delay. I'd time requests to hit immediately after a DB-changing operation, exploiting the invalidation lag.
+
+---
+
+**Scenario E: A developer says "we use transactions, so we're safe from race conditions." Do you agree?**
+
+> Not entirely. Transactions help but don't automatically eliminate race conditions — isolation level matters critically. At the default `READ COMMITTED` level (used by most applications), two concurrent transactions can both read the same row before either commits — a non-repeatable read. The lost update problem persists. `REPEATABLE READ` prevents that for reads, but phantom reads (new rows matching a condition) can still occur. Only `SERIALIZABLE` isolation truly prevents all race condition anomalies, but at a performance cost. The developer also needs `SELECT FOR UPDATE` to acquire row-level locks within the transaction. Transactions without explicit locking at the right isolation level can still be vulnerable.
+
+---
+
+**Scenario F: How would you demonstrate the impact of a race condition on a 2FA bypass?**
+
+> 1. Capture the `POST /verify-2fa` request with a valid OTP.
+> 2. The OTP should be single-use — valid once, then deleted/invalidated.
+> 3. Send 10 concurrent requests with the same OTP via Turbo Intruder.
+> 4. If vulnerable, multiple requests return `200 OK / authenticated: true`.
+> 5. The OTP was consumed only once (or not at all) due to the race — all parallel requests passed the "OTP valid?" check before any triggered the "delete OTP" write.
+> 6. Impact: 2FA is bypassable by an attacker who intercepts a single OTP (SMS intercept, phishing, shoulder surf) and immediately floods the endpoint.
+> 7. The fix: atomic DELETE-first (`DELETE FROM otp WHERE token = ? AND expires > NOW()`), then check `affectedRows === 1` before granting access.
+
+---
+
+## 17. Quick Reference Cheat Sheet
+
+```
+RACE CONDITION QUICK REFERENCE
+══════════════════════════════════════════════════════════════
+
+IDENTIFY IN CODE:
+  ✗ SELECT → business logic → UPDATE (outside transaction)
+  ✗ obj.field += 1 → obj.save() (ORM read-modify-write)
+  ✗ if not exists → insert (no UNIQUE constraint)
+  ✗ access() → open() (TOCTOU in C)
+  ✗ cache.get() → action (stale cache decision)
+
+TEST IN BURP:
+  1. Capture state-changing request
+  2. Repeater → Create group → Add tab to group
+  3. "Send group in parallel" OR
+  4. Turbo Intruder → race_single_packet.py template
+  5. Send 20-50 concurrent requests
+  6. Look for multiple success responses
+
+HIGH-VALUE TARGETS:
+  → Coupon / promo redemption
+  → Gift card / wallet balance
+  → OTP / 2FA verification
+  → Password reset tokens
+  → File upload + AV scan
+  → Rate limit / lockout counters
+  → Inventory / stock purchase
+  → Account deletion + action
+
+FIX PATTERNS:
+  ✓ Atomic SQL: UPDATE ... WHERE condition (check affected rows)
+  ✓ SELECT FOR UPDATE (row lock in transaction)
+  ✓ SERIALIZABLE isolation level
+  ✓ UNIQUE DB constraint (catch duplicate key error)
+  ✓ Idempotency keys (UUID per request, stored result)
+  ✓ Redis SETNX / Redlock (distributed lock)
+  ✓ Django: F() expressions instead of .save()
+  ✓ JPA: @Lock(PESSIMISTIC_WRITE)
+  ✓ Go: sync.Mutex on critical section
+
+KEY TERMS:
+  TOCTOU     → Time-of-Check to Time-of-Use
+  Atomicity  → All-or-nothing, no partial observation
+  Mutex      → Mutual exclusion lock (binary, owner-released)
+  Semaphore  → Counting access control (N concurrent allowed)
+  Deadlock   → Threads waiting on each other's locks
+  Lost Update → Concurrent writes where second overwrites first
+  Idempotent  → Same result regardless of how many times executed
+
+══════════════════════════════════════════════════════════════
+```
+
+---
+
+*Document prepared for Application Security & Penetration Testing professionals.*  
+*Techniques described are for authorized security testing only.*
